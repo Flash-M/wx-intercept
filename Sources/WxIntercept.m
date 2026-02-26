@@ -259,7 +259,7 @@ static void showNotification(NSString *sender, NSString *content) {
         id center = [UNCenter performSelector:@selector(currentNotificationCenter)];
         if (!center) {
             // macOS 10.14+ uses +currentNotificationCenter
-            center = objc_msgSend((id)UNCenter,
+            center = ((id (*)(id, SEL))objc_msgSend)((id)UNCenter,
                                   NSSelectorFromString(@"currentNotificationCenter"));
         }
 
