@@ -1,0 +1,63 @@
+---
+triple:          'arm64-apple-darwin'
+binary-path:     WxIntercept.dylib
+relocations:
+  - { offset: 0x27, size: 0x8, addend: 0x0, symName: '-[NSObject(WxInterceptHooks) wxi_onAddMsg:MgrType:]', symObjAddr: 0x0, symBinAddr: 0xE20, symSize: 0xA4 }
+  - { offset: 0x42, size: 0x8, addend: 0x0, symName: _WxInterceptInitialize, symObjAddr: 0x1C60, symBinAddr: 0x2A80, symSize: 0x34C }
+  - { offset: 0x65, size: 0x8, addend: 0x0, symName: _WxInterceptInitialize.hookSucceeded, symObjAddr: 0x93E5, symBinAddr: 0xC500, symSize: 0x0 }
+  - { offset: 0x7B, size: 0x8, addend: 0x0, symName: _WxInterceptInitialize.kLastDelay, symObjAddr: 0x5210, symBinAddr: 0x7D00, symSize: 0x0 }
+  - { offset: 0x147, size: 0x8, addend: 0x0, symName: '-[NSObject(WxInterceptHooks) wxi_onAddMsg:MgrType:]', symObjAddr: 0x0, symBinAddr: 0xE20, symSize: 0xA4 }
+  - { offset: 0x195, size: 0x8, addend: 0x0, symName: '-[NSObject(WxInterceptHooks) wxi_onAddMsg_v2:]', symObjAddr: 0xA4, symBinAddr: 0xEC4, symSize: 0x94 }
+  - { offset: 0x1D5, size: 0x8, addend: 0x0, symName: '-[NSObject(WxInterceptHooks) wxi_onRevokeMsg:]', symObjAddr: 0x138, symBinAddr: 0xF58, symSize: 0x318 }
+  - { offset: 0x24F, size: 0x8, addend: 0x0, symName: _tryAddRecalledMessageToChat, symObjAddr: 0x450, symBinAddr: 0x1270, symSize: 0xD74 }
+  - { offset: 0x363, size: 0x8, addend: 0x0, symName: _showNotification, symObjAddr: 0x11C4, symBinAddr: 0x1FE4, symSize: 0x7F0 }
+  - { offset: 0x578, size: 0x8, addend: 0x0, symName: '-[NSObject(WxInterceptHooks) wxi_onRevokeMsg_v2:]', symObjAddr: 0x19B4, symBinAddr: 0x27D4, symSize: 0x2AC }
+  - { offset: 0x62F, size: 0x8, addend: 0x0, symName: ___WxInterceptInitialize_block_invoke, symObjAddr: 0x1FAC, symBinAddr: 0x2DCC, symSize: 0xC8 }
+  - { offset: 0x66B, size: 0x8, addend: 0x0, symName: _tryHookMessageService, symObjAddr: 0x2074, symBinAddr: 0x2E94, symSize: 0x34C }
+  - { offset: 0x6FE, size: 0x8, addend: 0x0, symName: _setupNotificationFallback, symObjAddr: 0x23C0, symBinAddr: 0x31E0, symSize: 0x80 }
+  - { offset: 0x714, size: 0x8, addend: 0x0, symName: _kSessionKeys, symObjAddr: 0x2440, symBinAddr: 0x3260, symSize: 0xB8 }
+  - { offset: 0x72D, size: 0x8, addend: 0x0, symName: _safeKVC, symObjAddr: 0x24F8, symBinAddr: 0x3318, symSize: 0xC4 }
+  - { offset: 0x763, size: 0x8, addend: 0x0, symName: _recallDisplayText, symObjAddr: 0x25BC, symBinAddr: 0x33DC, symSize: 0x100 }
+  - { offset: 0x7A7, size: 0x8, addend: 0x0, symName: _kAddLocalMsgSelectors, symObjAddr: 0x26BC, symBinAddr: 0x34DC, symSize: 0x94 }
+  - { offset: 0x7C0, size: 0x8, addend: 0x0, symName: ___showNotification_block_invoke, symObjAddr: 0x2750, symBinAddr: 0x3570, symSize: 0x58 }
+  - { offset: 0x808, size: 0x8, addend: 0x0, symName: _kCandidateClasses, symObjAddr: 0x27A8, symBinAddr: 0x35C8, symSize: 0xC4 }
+  - { offset: 0x822, size: 0x8, addend: 0x0, symName: _hookClass, symObjAddr: 0x286C, symBinAddr: 0x368C, symSize: 0x410 }
+  - { offset: 0x8CF, size: 0x8, addend: 0x0, symName: _discoverMessageClasses, symObjAddr: 0x2C7C, symBinAddr: 0x3A9C, symSize: 0x3B4 }
+  - { offset: 0x9B2, size: 0x8, addend: 0x0, symName: _kAddMsgSelectors, symObjAddr: 0x3030, symBinAddr: 0x3E50, symSize: 0xE8 }
+  - { offset: 0x9CC, size: 0x8, addend: 0x0, symName: _trySwizzle, symObjAddr: 0x3118, symBinAddr: 0x3F38, symSize: 0xFC }
+  - { offset: 0xA32, size: 0x8, addend: 0x0, symName: _kRevokeMsgSelectors, symObjAddr: 0x3214, symBinAddr: 0x4034, symSize: 0x100 }
+  - { offset: 0xA4C, size: 0x8, addend: 0x0, symName: ___setupNotificationFallback_block_invoke, symObjAddr: 0x3314, symBinAddr: 0x4134, symSize: 0x158 }
+  - { offset: 0x10C3, size: 0x8, addend: 0x0, symName: '+[MessageCache sharedCache]', symObjAddr: 0x0, symBinAddr: 0x428C, symSize: 0x7C }
+  - { offset: 0x10D0, size: 0x8, addend: 0x0, symName: '+[MessageCache sharedCache]', symObjAddr: 0x0, symBinAddr: 0x428C, symSize: 0x7C }
+  - { offset: 0x10F9, size: 0x8, addend: 0x0, symName: _sharedCache.instance, symObjAddr: 0x5618, symBinAddr: 0xC508, symSize: 0x0 }
+  - { offset: 0x110E, size: 0x8, addend: 0x0, symName: _sharedCache.token, symObjAddr: 0x5620, symBinAddr: 0xC510, symSize: 0x0 }
+  - { offset: 0x1346, size: 0x8, addend: 0x0, symName: '___27+[MessageCache sharedCache]_block_invoke', symObjAddr: 0x7C, symBinAddr: 0x4308, symSize: 0x54 }
+  - { offset: 0x136E, size: 0x8, addend: 0x0, symName: '-[MessageCache init]', symObjAddr: 0xD0, symBinAddr: 0x435C, symSize: 0x144 }
+  - { offset: 0x13A4, size: 0x8, addend: 0x0, symName: '-[MessageCache cacheMessage:]', symObjAddr: 0x214, symBinAddr: 0x44A0, symSize: 0x180 }
+  - { offset: 0x13F2, size: 0x8, addend: 0x0, symName: '___29-[MessageCache cacheMessage:]_block_invoke', symObjAddr: 0x394, symBinAddr: 0x4620, symSize: 0x128 }
+  - { offset: 0x146D, size: 0x8, addend: 0x0, symName: ___copy_helper_block_e8_32s40s48s, symObjAddr: 0x4BC, symBinAddr: 0x4748, symSize: 0x70 }
+  - { offset: 0x1491, size: 0x8, addend: 0x0, symName: ___destroy_helper_block_e8_32s40s48s, symObjAddr: 0x52C, symBinAddr: 0x47B8, symSize: 0x54 }
+  - { offset: 0x14AD, size: 0x8, addend: 0x0, symName: '-[MessageCache messageWithId:]', symObjAddr: 0x580, symBinAddr: 0x480C, symSize: 0x19C }
+  - { offset: 0x1505, size: 0x8, addend: 0x0, symName: ___Block_byref_object_copy_, symObjAddr: 0x71C, symBinAddr: 0x49A8, symSize: 0x54 }
+  - { offset: 0x1529, size: 0x8, addend: 0x0, symName: ___Block_byref_object_dispose_, symObjAddr: 0x770, symBinAddr: 0x49FC, symSize: 0x2C }
+  - { offset: 0x1545, size: 0x8, addend: 0x0, symName: '___30-[MessageCache messageWithId:]_block_invoke', symObjAddr: 0x79C, symBinAddr: 0x4A28, symSize: 0x6C }
+  - { offset: 0x15AA, size: 0x8, addend: 0x0, symName: ___copy_helper_block_e8_32s40s48r, symObjAddr: 0x808, symBinAddr: 0x4A94, symSize: 0x70 }
+  - { offset: 0x15CE, size: 0x8, addend: 0x0, symName: ___destroy_helper_block_e8_32s40s48r, symObjAddr: 0x878, symBinAddr: 0x4B04, symSize: 0x54 }
+  - { offset: 0x15EA, size: 0x8, addend: 0x0, symName: '-[MessageCache removeMessageWithId:]', symObjAddr: 0x8CC, symBinAddr: 0x4B58, symSize: 0x10C }
+  - { offset: 0x162A, size: 0x8, addend: 0x0, symName: '___36-[MessageCache removeMessageWithId:]_block_invoke', symObjAddr: 0x9D8, symBinAddr: 0x4C64, symSize: 0x58 }
+  - { offset: 0x1678, size: 0x8, addend: 0x0, symName: ___copy_helper_block_e8_32s40s, symObjAddr: 0xA30, symBinAddr: 0x4CBC, symSize: 0x58 }
+  - { offset: 0x169C, size: 0x8, addend: 0x0, symName: ___destroy_helper_block_e8_32s40s, symObjAddr: 0xA88, symBinAddr: 0x4D14, symSize: 0x44 }
+  - { offset: 0x16B8, size: 0x8, addend: 0x0, symName: '+[MessageCache msgIdFromMessage:]', symObjAddr: 0xACC, symBinAddr: 0x4D58, symSize: 0x14C }
+  - { offset: 0x170A, size: 0x8, addend: 0x0, symName: _firstStringValue, symObjAddr: 0xC18, symBinAddr: 0x4EA4, symSize: 0x25C }
+  - { offset: 0x1774, size: 0x8, addend: 0x0, symName: _kMsgIdKeys, symObjAddr: 0xE74, symBinAddr: 0x5100, symSize: 0xAC }
+  - { offset: 0x178D, size: 0x8, addend: 0x0, symName: _kSvrIdKeys, symObjAddr: 0xF20, symBinAddr: 0x51AC, symSize: 0x94 }
+  - { offset: 0x17A6, size: 0x8, addend: 0x0, symName: '+[MessageCache msgIdFromRevokeInfo:]', symObjAddr: 0xFB4, symBinAddr: 0x5240, symSize: 0xB0 }
+  - { offset: 0x17EA, size: 0x8, addend: 0x0, symName: _kRevokeIdKeys, symObjAddr: 0x1064, symBinAddr: 0x52F0, symSize: 0xC4 }
+  - { offset: 0x1803, size: 0x8, addend: 0x0, symName: '+[MessageCache senderFromMessage:]', symObjAddr: 0x1128, symBinAddr: 0x53B4, symSize: 0x94 }
+  - { offset: 0x1847, size: 0x8, addend: 0x0, symName: _kSenderKeys, symObjAddr: 0x11BC, symBinAddr: 0x5448, symSize: 0xA0 }
+  - { offset: 0x18BA, size: 0x8, addend: 0x0, symName: '+[MessageCache contentStringFromMessage:]', symObjAddr: 0x125C, symBinAddr: 0x54E8, symSize: 0x53C }
+  - { offset: 0x19EB, size: 0x8, addend: 0x0, symName: _kMsgTypeKeys, symObjAddr: 0x1798, symBinAddr: 0x5A24, symSize: 0x94 }
+  - { offset: 0x1A04, size: 0x8, addend: 0x0, symName: _kContentKeys, symObjAddr: 0x182C, symBinAddr: 0x5AB8, symSize: 0x94 }
+  - { offset: 0x1A1D, size: 0x8, addend: 0x0, symName: '-[MessageCache .cxx_destruct]', symObjAddr: 0x18C0, symBinAddr: 0x5B4C, symSize: 0x58 }
+  - { offset: 0x1A4F, size: 0x8, addend: 0x0, symName: _safeValueForKey, symObjAddr: 0x1918, symBinAddr: 0x5BA4, symSize: 0xC4 }
+...

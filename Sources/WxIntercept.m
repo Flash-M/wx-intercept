@@ -39,7 +39,8 @@
 // ---------------------------------------------------------------------------
 // Forward declarations
 // ---------------------------------------------------------------------------
-static void hookMessageService(void);
+static BOOL tryHookMessageService(void);
+static void setupNotificationFallback(void);
 static void hookClass(Class cls);
 static BOOL trySwizzle(Class cls, SEL orig, SEL replacement);
 static void showNotification(NSString *sender, NSString *content);
@@ -60,6 +61,9 @@ static void tryAddRecalledMessageToChat(id messageService,
 /// Replacement for MessageService / CMessageMgr  -onAddMsg:MgrType:
 - (void)wxi_onAddMsg:(id)message MgrType:(int)type;
 
+/// Replacement for single-arg add-message variant
+- (void)wxi_onAddMsg_v2:(id)message;
+
 /// Replacement for MessageService / CMessageMgr  -onRevokeMsg:
 - (void)wxi_onRevokeMsg:(id)revokeInfo;
 
@@ -79,6 +83,14 @@ static void tryAddRecalledMessageToChat(id messageService,
     // Call original (swizzled names are exchanged, so "wxi_" now points at
     // the original IMP)
     [self wxi_onAddMsg:message MgrType:type];
+}
+
+// ---------------------------------------------------------------------------
+// Message-add hook (single-argument variant)
+// ---------------------------------------------------------------------------
+- (void)wxi_onAddMsg_v2:(id)message {
+    [[MessageCache sharedCache] cacheMessage:message];
+    [self wxi_onAddMsg_v2:message];
 }
 
 // ---------------------------------------------------------------------------
@@ -366,13 +378,53 @@ static BOOL trySwizzle(Class cls, SEL orig, SEL replacement) {
 // Hook installation
 // ---------------------------------------------------------------------------
 
-/// Candidate class names to hook (tried in order; first match wins per method).
+/// Candidate class names to hook (tried in order).
 static NSArray<NSString *> *kCandidateClasses(void) {
     return @[
         @"MessageService",
         @"CMessageMgr",
         @"WCMessageManager",
         @"MessageManager",
+        @"FMessageService",
+        @"FMsg",
+        @"MMMessageService",
+        @"MMChatMessageService",
+    ];
+}
+
+/// All candidate selectors for the "add message" hook.
+static NSArray<NSString *> *kAddMsgSelectors(void) {
+    return @[
+        @"onAddMsg:MgrType:",
+        @"OnAddMsg:MgrType:",
+        @"addMsg:MgrType:",
+        @"AddMsg:MgrType:",
+        @"onAddMsg:",
+        @"OnAddMsg:",
+        @"addMsg:",
+        @"MessageSvrNotify:",
+        @"nativeNotifyAddMsgs:",
+        @"notifyAddMsgOnMainThread:",
+        @"addMsgNotify:",
+    ];
+}
+
+/// All candidate selectors for the "revoke message" hook.
+static NSArray<NSString *> *kRevokeMsgSelectors(void) {
+    return @[
+        @"onRevokeMsg:",
+        @"OnRevokeMsg:",
+        @"revokeMsg:",
+        @"RevokeMsg:",
+        @"didReceiveRevokeMsg:",
+        @"handleRevokeMsg:",
+        @"processRevokeMsg:",
+        @"nativeNotifyRevokeMsgs:",
+        @"notifyRevokeMsgOnMainThread:",
+        @"HandleMsgBeRevoked:",
+        @"handleMsgBeRevoked:",
+        @"revokeMsgNotify:",
+        @"messageRevoked:",
     ];
 }
 
@@ -380,46 +432,134 @@ static NSArray<NSString *> *kCandidateClasses(void) {
 static void hookClass(Class cls) {
     if (!cls) return;
 
-    // -- Cache all inbound messages --
-    trySwizzle(cls,
-               @selector(onAddMsg:MgrType:),
-               @selector(wxi_onAddMsg:MgrType:));
+    // -- Cache all inbound messages: try multiple selector names --
+    for (NSString *selName in kAddMsgSelectors()) {
+        SEL sel = NSSelectorFromString(selName);
+        if (class_getInstanceMethod(cls, sel)) {
+            // Choose the right replacement based on argument count
+            SEL replacement;
+            if ([selName containsString:@"MgrType:"]) {
+                replacement = @selector(wxi_onAddMsg:MgrType:);
+            } else {
+                replacement = @selector(wxi_onRevokeMsg_v2:); // single-arg, reuse to cache
+                // Actually we need a dedicated single-arg add hook — add one
+                replacement = @selector(wxi_onAddMsg_v2:);
+            }
+            if (trySwizzle(cls, sel, replacement)) {
+                WXILog(@"Hooked add-msg: [%@ %@]", NSStringFromClass(cls), selName);
+                break;
+            }
+        }
+    }
 
-    // -- Intercept revoke (two-arg) --
-    BOOL hookedRevoke =
-        trySwizzle(cls,
-                   @selector(onRevokeMsg:),
-                   @selector(wxi_onRevokeMsg:));
-
-    // -- Intercept revoke (one-arg alternate) --
-    if (!hookedRevoke) {
-        // Some builds use a different selector name
-        for (NSString *selName in @[@"revokeMsg:", @"didReceiveRevokeMsg:",
-                                    @"handleRevokeMsg:", @"processRevokeMsg:"]) {
-            if (trySwizzle(cls,
-                           NSSelectorFromString(selName),
-                           @selector(wxi_onRevokeMsg_v2:))) {
+    // -- Intercept revoke --
+    for (NSString *selName in kRevokeMsgSelectors()) {
+        SEL sel = NSSelectorFromString(selName);
+        if (class_getInstanceMethod(cls, sel)) {
+            if (trySwizzle(cls, sel, @selector(wxi_onRevokeMsg:))) {
+                WXILog(@"Hooked revoke-msg: [%@ %@]", NSStringFromClass(cls), selName);
                 break;
             }
         }
     }
 }
 
-static void hookMessageService(void) {
+/// Dynamically scan the ObjC runtime for classes that have message-related
+/// selectors. This handles WeChat versions that renamed their classes.
+static NSArray<Class> *discoverMessageClasses(void) {
+    NSMutableSet<Class> *found = [NSMutableSet set];
+
+    // Build a combined set of selectors to look for
+    NSMutableArray<NSString *> *allSelNames = [NSMutableArray array];
+    [allSelNames addObjectsFromArray:kAddMsgSelectors()];
+    [allSelNames addObjectsFromArray:kRevokeMsgSelectors()];
+
+    unsigned int classCount = 0;
+    Class *classes = objc_copyClassList(&classCount);
+    if (!classes) return @[];
+
+    WXILog(@"Scanning %u runtime classes for message-related selectors…", classCount);
+
+    for (unsigned int i = 0; i < classCount; i++) {
+        Class cls = classes[i];
+        // Skip Apple / system frameworks to speed up the scan
+        const char *name = class_getName(cls);
+        if (!name) continue;
+        // Only check classes that look WeChat-related (heuristic)
+        // Skip obvious Apple prefixes
+        if (name[0] == '_' && name[1] == '_') continue;
+
+        for (NSString *selName in allSelNames) {
+            SEL sel = NSSelectorFromString(selName);
+            if (class_getInstanceMethod(cls, sel)) {
+                [found addObject:cls];
+                WXILog(@"Discovered class with [%s %@]", name, selName);
+                break;
+            }
+        }
+    }
+
+    free(classes);
+    return [found allObjects];
+}
+
+// ---------------------------------------------------------------------------
+// Notification-based fallback for WeChat versions where no ObjC message
+// classes are found.  We observe NSNotificationCenter for any WeChat-posted
+// revoke notifications.
+// ---------------------------------------------------------------------------
+static void setupNotificationFallback(void) {
+    WXILog(@"Setting up notification-based fallback monitoring.");
+
+    // Monitor all NSNotificationCenter notifications for revoke-related ones
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:nil
+                    object:nil
+                     queue:nil
+                usingBlock:^(NSNotification *note) {
+        NSString *name = note.name;
+        // Look for notifications related to message revoke
+        if ([name containsString:@"revoke"] ||
+            [name containsString:@"Revoke"] ||
+            [name containsString:@"REVOKE"] ||
+            [name containsString:@"recall"] ||
+            [name containsString:@"Recall"]) {
+            WXILog(@"Caught notification: %@ userInfo=%@",
+                   name, note.userInfo);
+            showNotification(@"未知", @"检测到撤回通知");
+        }
+    }];
+
+    WXILog(@"Notification fallback monitoring active.");
+}
+
+/// Try to install hooks; returns YES if at least one hook landed.
+static BOOL tryHookMessageService(void) {
     BOOL hooked = NO;
+
+    // 1. Try well-known class names first
     for (NSString *className in kCandidateClasses()) {
         Class cls = NSClassFromString(className);
         if (cls) {
-            WXILog(@"Installing hooks on class: %@", className);
+            WXILog(@"Installing hooks on known class: %@", className);
             hookClass(cls);
             hooked = YES;
-            // Don't break — WeChat may split functionality across multiple classes
         }
     }
+
+    // 2. If none of the known names matched, scan the runtime
     if (!hooked) {
-        WXILog(@"WARNING: None of the expected WeChat classes were found. "
-               @"The plugin may not be compatible with this version of WeChat.");
+        WXILog(@"Known class names not found — scanning runtime…");
+        NSArray<Class> *discovered = discoverMessageClasses();
+        for (Class cls in discovered) {
+            WXILog(@"Installing hooks on discovered class: %@",
+                   NSStringFromClass(cls));
+            hookClass(cls);
+            hooked = YES;
+        }
     }
+
+    return hooked;
 }
 
 // ---------------------------------------------------------------------------
@@ -430,13 +570,33 @@ static void WxInterceptInitialize(void) {
     WXILog(@"Loaded. Initializing message recall interceptor…");
     WXILog(@"Build: %s %s", __DATE__, __TIME__);
 
-    // WeChat's Objective-C classes are registered at launch.  We defer the
-    // hook installation by a short interval so that all classes are available.
-    dispatch_after(
-        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-        dispatch_get_main_queue(),
-        ^{
-            hookMessageService();
-            WXILog(@"Hook installation complete.");
-        });
+    // WeChat's Objective-C classes may be registered lazily.
+    // Try multiple times with increasing delays.
+    static BOOL hookSucceeded = NO;
+    static const int kLastDelay = 8;
+
+    NSArray<NSNumber *> *delays = @[@1, @3, @5, @(kLastDelay)];
+
+    for (NSNumber *delayNum in delays) {
+        int d = delayNum.intValue;
+        dispatch_after(
+            dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)),
+            dispatch_get_main_queue(),
+            ^{
+                if (hookSucceeded) return;
+
+                WXILog(@"Attempting hook installation (delay=%ds)…", d);
+                if (tryHookMessageService()) {
+                    hookSucceeded = YES;
+                    WXILog(@"Hook installation succeeded.");
+                } else {
+                    WXILog(@"Hook attempt at %ds: no classes found yet.", d);
+                    if (d == kLastDelay) {
+                        WXILog(@"WARNING: All hook attempts exhausted. "
+                               @"Activating notification fallback.");
+                        setupNotificationFallback();
+                    }
+                }
+            });
+    }
 }
