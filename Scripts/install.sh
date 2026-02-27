@@ -96,19 +96,24 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Inject load command
+# Inject load command (only if not already present)
 # ---------------------------------------------------------------------------
-info "Injecting load command with insert_dylib…"
-# insert_dylib writes the patched binary to the same path when --inplace is used
-if insert_dylib \
-    --inplace \
-    --strip-codesig \
-    --all-yes \
-    "${DYLIB_INSTALL_PATH}" \
-    "${WECHAT_BINARY}"; then
-    ok "Load command injected."
+if otool -L "${WECHAT_BINARY}" 2>/dev/null | grep -q "${DYLIB_NAME}"; then
+    warn "Load command for ${DYLIB_NAME} already exists in binary. Skipping injection."
+    warn "If you want to re-inject, first run 'make uninstall' then 'make install'."
 else
-    die "insert_dylib failed. The original binary has not been modified (backup is safe)."
+    info "Injecting load command with insert_dylib…"
+    # insert_dylib writes the patched binary to the same path when --inplace is used
+    if insert_dylib \
+        --inplace \
+        --strip-codesig \
+        --all-yes \
+        "${DYLIB_INSTALL_PATH}" \
+        "${WECHAT_BINARY}"; then
+        ok "Load command injected."
+    else
+        die "insert_dylib failed. The original binary has not been modified (backup is safe)."
+    fi
 fi
 
 # ---------------------------------------------------------------------------

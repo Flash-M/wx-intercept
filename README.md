@@ -2,9 +2,30 @@
 
 macOS 微信聊天消息防撤回插件，支持 Intel（x86_64）和 Apple Silicon（arm64）双架构。
 
+> ⚠️ **重要提示**: WeChat 4.x 版本采用了新的多进程架构，当前方案在新版本上效果有限。
+> 详见 [TECHNICAL_ANALYSIS.md](TECHNICAL_ANALYSIS.md) 了解技术分析和替代方案。
+
 当聊天对方撤回消息时，插件将：
 1. 在**原对话窗口**中重新展示被撤回的消息内容（格式：`[撤回] 发送人: 内容`）。
 2. 同时弹出一条 **macOS 系统通知**，确保消息内容不会丢失。
+
+---
+
+## 支持版本
+
+| WeChat 版本 | 状态 |
+|-------------|------|
+| 3.x | ✅ 应该工作 |
+| 4.x (4.1.7+) | ⚠️ 受限 - 见下方说明 |
+
+### WeChat 4.x 限制
+
+WeChat 4.x 采用类似 Electron 的多进程架构：
+- 主进程只负责启动管理
+- 消息处理在 WeChatAppEx 子进程中
+- 数据库使用 SQLCipher 加密
+
+当前方案在 WeChat 4.x 上只能捕获 Mojo IPC 控制消息，无法直接拦截消息内容。
 
 ---
 
@@ -131,3 +152,28 @@ bash Scripts/uninstall.sh
 - **微信更新**：每次微信版本更新后，需重新执行安装步骤（更新会覆盖被修改的二进制文件）。
 - **隐私**：插件仅在内存中缓存最近 2000 条消息，不持久化存储，不上传任何数据。
 - **免责声明**：本项目仅供学习研究，请勿用于任何违法用途。使用本插件须自行承担风险。
+
+---
+
+## 相关文档
+
+- [TECHNICAL_ANALYSIS.md](TECHNICAL_ANALYSIS.md) - 详细的技术分析文档（WeChat 4.x 架构分析）
+- [PROGRESS.md](PROGRESS.md) - 开发进度记录
+
+---
+
+## 调试命令
+
+```bash
+# 查看插件日志
+log stream --process WeChat --predicate 'eventMessage contains "WxIntercept"'
+
+# 查看 IPC 数据日志
+cat /tmp/wxintercept_ipc.log
+
+# 监控数据库变化
+python3 Scripts/fsmonitor.py
+
+# 分析数据库加密状态
+python3 Scripts/fsmonitor.py --analyze
+```

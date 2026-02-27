@@ -23,7 +23,7 @@ PRODUCT   = WxIntercept.dylib
 # Source files
 # ---------------------------------------------------------------------------
 SRCS      = Sources/WxIntercept.m \
-            Sources/MessageCache.m
+            Sources/fishhook.c
 
 # ---------------------------------------------------------------------------
 # Compiler flags
