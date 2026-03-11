@@ -1,0 +1,730 @@
+/**
+ * WxIntercept.m
+ * wx-intercept — WeChat Mac Message Recall Interceptor
+ *
+ * WeChat 4.x for macOS uses a Chromium/Mojo IPC architecture with C++/Rust
+ * core (via cxxbridge). Traditional ObjC swizzling of MessageService /
+ * CMessageMgr is no longer possible.
+ *
+ * Strategy for WeChat 4.x:
+ *   1. Hook SQLite commit/update operations to detect message deletions
+ *      (revoke = UPDATE + DELETE on the msg table).
+ *   2. Monitor the WeChat WCDB message database files for changes.
+ *   3. Hook libmmmojo.dylib IPC functions via fishhook to intercept
+ *      revoke commands at the network layer.
+ *   4. ObjC runtime scanning as fallback for older versions.
+ *
+ * Build:  see Makefile at the repository root.
+ * Install: see Scripts/install.sh.
+ */
+
+#import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>
+#import <UserNotifications/UserNotifications.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
+#import <dlfcn.h>
+#import <sqlite3.h>
+
+#import "MessageCache.h"
+#import "fishhook.h"
+
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+#define WXILog(fmt, ...) \
+    NSLog(@"[WxIntercept] " fmt, ##__VA_ARGS__)
+
+// ---------------------------------------------------------------------------
+// Forward declarations
+// ---------------------------------------------------------------------------
+static void showNotification(NSString *sender, NSString *content);
+static void hookMojoIPC(void);
+static void hookSQLiteOperations(void);
+static void hookObjCClasses(void);
+static void monitorMessageDatabase(void);
+static BOOL trySwizzle(Class cls, SEL orig, SEL replacement);
+
+// ---------------------------------------------------------------------------
+// 1. SQLite hook approach — intercept sqlite3_exec / sqlite3_prepare_v2
+//    to detect revoke DELETE operations on msg tables
+// ---------------------------------------------------------------------------
+
+// Original function pointers (saved by fishhook)
+static int (*orig_sqlite3_prepare_v2)(sqlite3 *db, const char *zSql, int nByte,
+                                       sqlite3_stmt **ppStmt, const char **pzTail) = NULL;
+static int (*orig_sqlite3_exec)(sqlite3 *db, const char *sql,
+                                int (*callback)(void*,int,char**,char**),
+                                void *arg, char **errmsg) = NULL;
+
+// Track message content before revoke deletes it.
+// Key: "db_path:msgSvrId" -> content string
+static NSMutableDictionary *sRecentMessages = nil;
+static dispatch_queue_t sSqliteQueue = nil;
+
+// Check if SQL is a revoke-related operation
+static BOOL isRevokeSQL(const char *sql) {
+    if (!sql) return NO;
+    // WeChat revoke typically does:
+    // 1. UPDATE ... SET type=10002 ... (mark as revoked system message)
+    // 2. Or contains "10002" (revoke msg type) in an INSERT/UPDATE
+    // Look for type 10002 which is the revoke system message type
+    if (strstr(sql, "10002") != NULL) return YES;
+    if (strcasestr(sql, "revoke") != NULL) return YES;
+    return NO;
+}
+
+// Check if SQL is a message operation
+static BOOL isMessageSQL(const char *sql) {
+    if (!sql) return NO;
+    // WeChat message tables are named like Chat_xxxx or msg_x
+    if (strcasestr(sql, "Chat_") != NULL) return YES;
+    if (strcasestr(sql, "msg_") != NULL) return YES;
+    if (strcasestr(sql, "message") != NULL) return YES;
+    return NO;
+}
+
+// Our hooked sqlite3_prepare_v2 — intercepts all prepared statements
+static int hooked_sqlite3_prepare_v2(sqlite3 *db, const char *zSql, int nByte,
+                                      sqlite3_stmt **ppStmt, const char **pzTail) {
+    if (zSql && isMessageSQL(zSql)) {
+        if (isRevokeSQL(zSql)) {
+            WXILog(@"[SQLite] Revoke-related SQL detected: %.200s", zSql);
+            
+            // Try to extract content before it's deleted
+            dispatch_async(sSqliteQueue, ^{
+                NSString *sqlStr = [NSString stringWithUTF8String:zSql];
+                showNotification(@"消息撤回", 
+                    [NSString stringWithFormat:@"检测到撤回操作: %@", 
+                     [sqlStr substringToIndex:MIN(sqlStr.length, 100)]]);
+            });
+        }
+    }
+    return orig_sqlite3_prepare_v2(db, zSql, nByte, ppStmt, pzTail);
+}
+
+// Our hooked sqlite3_exec
+static int hooked_sqlite3_exec(sqlite3 *db, const char *sql,
+                               int (*callback)(void*,int,char**,char**),
+                               void *arg, char **errmsg) {
+    if (sql && isMessageSQL(sql)) {
+        if (isRevokeSQL(sql)) {
+            WXILog(@"[SQLite-exec] Revoke-related SQL detected: %.200s", sql);
+            
+            dispatch_async(sSqliteQueue, ^{
+                NSString *sqlStr = [NSString stringWithUTF8String:sql];
+                showNotification(@"消息撤回",
+                    [NSString stringWithFormat:@"检测到撤回操作: %@",
+                     [sqlStr substringToIndex:MIN(sqlStr.length, 100)]]);
+            });
+        }
+    }
+    return orig_sqlite3_exec(db, sql, callback, arg, errmsg);
+}
+
+static void hookSQLiteOperations(void) {
+    WXILog(@"Installing SQLite hooks via fishhook...");
+    
+    struct rebinding rebindings[] = {
+        {"sqlite3_prepare_v2", (void *)hooked_sqlite3_prepare_v2, (void **)&orig_sqlite3_prepare_v2},
+        {"sqlite3_exec", (void *)hooked_sqlite3_exec, (void **)&orig_sqlite3_exec},
+    };
+    
+    int result = rebind_symbols(rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
+    if (result == 0) {
+        WXILog(@"SQLite hooks installed successfully.");
+        WXILog(@"  sqlite3_prepare_v2 original: %p", orig_sqlite3_prepare_v2);
+        WXILog(@"  sqlite3_exec original: %p", orig_sqlite3_exec);
+    } else {
+        WXILog(@"WARNING: Failed to install SQLite hooks (result=%d)", result);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 2. Mojo IPC hooks — intercept libmmmojo.dylib functions
+// ---------------------------------------------------------------------------
+
+// Function pointer types for libmmmojo functions
+typedef void *(*SendMMMojoWriteInfo_t)(void *env, void *info);
+typedef void *(*GetMMMojoReadInfoRequest_t)(void *info);
+typedef void  (*SetMMMojoEnvironmentCallbacks_t)(void *env, void *callbacks);
+
+// Original function pointers
+static SendMMMojoWriteInfo_t orig_SendMMMojoWriteInfo = NULL;
+static GetMMMojoReadInfoRequest_t orig_GetMMMojoReadInfoRequest = NULL;
+static SetMMMojoEnvironmentCallbacks_t orig_SetMMMojoEnvironmentCallbacks = NULL;
+
+// Counter for IPC traffic logging
+static int sMojoCallCount = 0;
+
+// Hooked SendMMMojoWriteInfo — intercepts outgoing IPC messages
+static void *hooked_SendMMMojoWriteInfo(void *env, void *info) {
+    sMojoCallCount++;
+    if (sMojoCallCount <= 20 || sMojoCallCount % 100 == 0) {
+        WXILog(@"[Mojo] SendMMMojoWriteInfo called (#%d) env=%p info=%p",
+               sMojoCallCount, env, info);
+    }
+    return orig_SendMMMojoWriteInfo(env, info);
+}
+
+// Hooked GetMMMojoReadInfoRequest — intercepts incoming IPC request data
+static void *hooked_GetMMMojoReadInfoRequest(void *info) {
+    void *result = orig_GetMMMojoReadInfoRequest(info);
+    static int readCount = 0;
+    readCount++;
+    if (readCount <= 20 || readCount % 100 == 0) {
+        WXILog(@"[Mojo] GetMMMojoReadInfoRequest info=%p result=%p (#%d)",
+               info, result, readCount);
+    }
+    return result;
+}
+
+// Hooked SetMMMojoEnvironmentCallbacks — intercepts callback registration
+static void hooked_SetMMMojoEnvironmentCallbacks(void *env, void *callbacks) {
+    WXILog(@"[Mojo] SetMMMojoEnvironmentCallbacks env=%p callbacks=%p", env, callbacks);
+    orig_SetMMMojoEnvironmentCallbacks(env, callbacks);
+}
+
+static void hookMojoIPC(void) {
+    WXILog(@"Installing Mojo IPC hooks via fishhook...");
+    
+    struct rebinding rebindings[] = {
+        {"SendMMMojoWriteInfo", (void *)hooked_SendMMMojoWriteInfo, (void **)&orig_SendMMMojoWriteInfo},
+        {"GetMMMojoReadInfoRequest", (void *)hooked_GetMMMojoReadInfoRequest, (void **)&orig_GetMMMojoReadInfoRequest},
+        {"SetMMMojoEnvironmentCallbacks", (void *)hooked_SetMMMojoEnvironmentCallbacks, (void **)&orig_SetMMMojoEnvironmentCallbacks},
+    };
+    
+    int result = rebind_symbols(rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
+    if (result == 0) {
+        WXILog(@"Mojo IPC hooks installed successfully.");
+        WXILog(@"  SendMMMojoWriteInfo original: %p", orig_SendMMMojoWriteInfo);
+        WXILog(@"  GetMMMojoReadInfoRequest original: %p", orig_GetMMMojoReadInfoRequest);
+        WXILog(@"  SetMMMojoEnvironmentCallbacks original: %p", orig_SetMMMojoEnvironmentCallbacks);
+    } else {
+        WXILog(@"WARNING: Failed to install Mojo IPC hooks (result=%d)", result);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3. Message database file monitoring (FSEvents / dispatch_source)
+// ---------------------------------------------------------------------------
+
+static dispatch_source_t sDBWatcher = nil;
+
+/// Find the WeChat message database directory
+static NSString *findMessageDBDirectory(void) {
+    NSString *container = [@"~/Library/Containers/com.tencent.xinWeChat/Data/Library/Application Support/com.tencent.xinWeChat"
+                           stringByExpandingTildeInPath];
+    
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *contents = [fm contentsOfDirectoryAtPath:container error:nil];
+    
+    for (NSString *version in contents) {
+        NSString *versionPath = [container stringByAppendingPathComponent:version];
+        NSArray *subContents = [fm contentsOfDirectoryAtPath:versionPath error:nil];
+        
+        for (NSString *userHash in subContents) {
+            NSString *msgDir = [[versionPath stringByAppendingPathComponent:userHash]
+                               stringByAppendingPathComponent:@"Message"];
+            if ([fm fileExistsAtPath:msgDir]) {
+                WXILog(@"Found message DB directory: %@", msgDir);
+                return msgDir;
+            }
+        }
+    }
+    return nil;
+}
+
+/// Monitor the message database directory for changes using dispatch_source
+static void monitorMessageDatabase(void) {
+    NSString *msgDir = findMessageDBDirectory();
+    if (!msgDir) {
+        WXILog(@"WARNING: Could not find WeChat message database directory.");
+        return;
+    }
+    
+    int fd = open(msgDir.fileSystemRepresentation, O_EVTONLY);
+    if (fd < 0) {
+        WXILog(@"WARNING: Could not open message DB directory for monitoring.");
+        return;
+    }
+    
+    sDBWatcher = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_VNODE, fd,
+        DISPATCH_VNODE_WRITE | DISPATCH_VNODE_EXTEND | DISPATCH_VNODE_RENAME,
+        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0));
+    
+    dispatch_source_set_event_handler(sDBWatcher, ^{
+        unsigned long flags = dispatch_source_get_data(sDBWatcher);
+        WXILog(@"[DB Monitor] Message DB directory changed (flags=0x%lx)", flags);
+    });
+    
+    dispatch_source_set_cancel_handler(sDBWatcher, ^{
+        close(fd);
+    });
+    
+    dispatch_resume(sDBWatcher);
+    WXILog(@"Message DB directory monitoring active: %@", msgDir);
+}
+
+// ---------------------------------------------------------------------------
+// 4. ObjC runtime scanning (fallback for older WeChat versions)
+// ---------------------------------------------------------------------------
+
+@interface NSObject (WxInterceptHooks)
+- (void)wxi_onAddMsg:(id)message MgrType:(int)type;
+- (void)wxi_onAddMsg_v2:(id)message;
+- (void)wxi_onRevokeMsg:(id)revokeInfo;
+- (void)wxi_onRevokeMsg_v2:(id)revokeInfo;
+@end
+
+@implementation NSObject (WxInterceptHooks)
+
+- (void)wxi_onAddMsg:(id)message MgrType:(int)type {
+    [[MessageCache sharedCache] cacheMessage:message];
+    [self wxi_onAddMsg:message MgrType:type];
+}
+
+- (void)wxi_onAddMsg_v2:(id)message {
+    [[MessageCache sharedCache] cacheMessage:message];
+    [self wxi_onAddMsg_v2:message];
+}
+
+- (void)wxi_onRevokeMsg:(id)revokeInfo {
+    WXILog(@"onRevokeMsg: triggered — revokeInfo=%@", revokeInfo);
+    
+    NSString *msgId = [MessageCache msgIdFromRevokeInfo:revokeInfo];
+    id originalMessage = msgId ? [[MessageCache sharedCache] messageWithId:msgId] : nil;
+    NSString *content  = [MessageCache contentStringFromMessage:originalMessage];
+    NSString *sender   = [MessageCache senderFromMessage:originalMessage];
+    
+    [self wxi_onRevokeMsg:revokeInfo];
+    
+    if (originalMessage) {
+        WXILog(@"Intercepted recalled message from %@: %@", sender ?: @"?", content);
+    }
+    
+    showNotification(sender, content);
+    if (msgId) [[MessageCache sharedCache] removeMessageWithId:msgId];
+}
+
+- (void)wxi_onRevokeMsg_v2:(id)revokeInfo {
+    WXILog(@"onRevokeMsg (v2) triggered");
+    
+    NSString *msgId       = [MessageCache msgIdFromRevokeInfo:revokeInfo];
+    id originalMessage    = msgId ? [[MessageCache sharedCache] messageWithId:msgId] : nil;
+    NSString *content     = [MessageCache contentStringFromMessage:originalMessage];
+    NSString *sender      = [MessageCache senderFromMessage:originalMessage];
+    
+    [self wxi_onRevokeMsg_v2:revokeInfo];
+    
+    if (originalMessage) {
+        WXILog(@"Intercepted recalled message from %@: %@", sender ?: @"?", content);
+    }
+    
+    showNotification(sender, content);
+    if (msgId) [[MessageCache sharedCache] removeMessageWithId:msgId];
+}
+
+@end
+
+// ---------------------------------------------------------------------------
+// ObjC hook installation helpers
+// ---------------------------------------------------------------------------
+
+static BOOL trySwizzle(Class cls, SEL orig, SEL replacement) {
+    Method origMethod = class_getInstanceMethod(cls, orig);
+    Method replMethod = class_getInstanceMethod(cls, replacement);
+    if (!origMethod || !replMethod) return NO;
+    method_exchangeImplementations(origMethod, replMethod);
+    WXILog(@"Swizzled [%@ %@]", NSStringFromClass(cls), NSStringFromSelector(orig));
+    return YES;
+}
+
+/// Candidate class names
+static NSArray<NSString *> *kCandidateClasses(void) {
+    return @[
+        @"MessageService", @"CMessageMgr", @"WCMessageManager",
+        @"MessageManager", @"FMessageService", @"FMsg",
+        @"MMMessageService", @"MMChatMessageService",
+    ];
+}
+
+static NSArray<NSString *> *kAddMsgSelectors(void) {
+    return @[
+        @"onAddMsg:MgrType:", @"OnAddMsg:MgrType:",
+        @"addMsg:MgrType:", @"AddMsg:MgrType:",
+        @"onAddMsg:", @"OnAddMsg:", @"addMsg:",
+        @"MessageSvrNotify:", @"nativeNotifyAddMsgs:",
+        @"notifyAddMsgOnMainThread:", @"addMsgNotify:",
+    ];
+}
+
+static NSArray<NSString *> *kRevokeMsgSelectors(void) {
+    return @[
+        @"onRevokeMsg:", @"OnRevokeMsg:", @"revokeMsg:",
+        @"RevokeMsg:", @"didReceiveRevokeMsg:", @"handleRevokeMsg:",
+        @"processRevokeMsg:", @"nativeNotifyRevokeMsgs:",
+        @"notifyRevokeMsgOnMainThread:", @"HandleMsgBeRevoked:",
+        @"handleMsgBeRevoked:", @"revokeMsgNotify:", @"messageRevoked:",
+    ];
+}
+
+static BOOL isWeChatRelatedClass(const char *name) {
+    if (!name || name[0] == '\0') return NO;
+    
+    static const char *systemPrefixes[] = {
+        "NS", "CF", "CA", "CI", "CL", "CK", "UI", "UINS",
+        "AV", "AX", "AC", "AU", "AF", "AS", "AT",
+        "GC", "GL", "MK", "ML", "MP", "MT",
+        "PH", "PK", "QL", "SF", "SK", "SL", "SC",
+        "WK", "XC", "OS_", "__",
+        "_NS", "_CF", "_UI", "_PF",
+        "Dispatch", "Swift",
+        "JSC", "JSExport", "RBS", "BSS", "BKS",
+        "FBS", "TCC", "LSA", "CUI",
+        "DRW", "DRT", "DR", "View", "SCRC",
+        NULL
+    };
+    for (int i = 0; systemPrefixes[i]; i++) {
+        if (strncmp(name, systemPrefixes[i], strlen(systemPrefixes[i])) == 0)
+            return NO;
+    }
+    
+    static const char *keywords[] = {
+        "Message", "message", "Msg", "msg",
+        "Chat", "chat", "Revoke", "revoke",
+        "Recall", "recall", "Session", "session",
+        "WeChat", "WC", "MM", "FM",
+        "Kernel", "kernel", "Service", "Mgr",
+        NULL
+    };
+    for (int i = 0; keywords[i]; i++) {
+        if (strstr(name, keywords[i]))
+            return YES;
+    }
+    return NO;
+}
+
+static void hookClass(Class cls) {
+    if (!cls) return;
+    
+    for (NSString *selName in kAddMsgSelectors()) {
+        SEL sel = NSSelectorFromString(selName);
+        BOOL hasMethod = NO;
+        @try { hasMethod = (class_getInstanceMethod(cls, sel) != NULL); }
+        @catch (...) { continue; }
+        if (hasMethod) {
+            SEL replacement;
+            if ([selName containsString:@"MgrType:"]) {
+                replacement = @selector(wxi_onAddMsg:MgrType:);
+            } else {
+                replacement = @selector(wxi_onAddMsg_v2:);
+            }
+            if (trySwizzle(cls, sel, replacement)) {
+                WXILog(@"Hooked add-msg: [%@ %@]", NSStringFromClass(cls), selName);
+                break;
+            }
+        }
+    }
+    
+    for (NSString *selName in kRevokeMsgSelectors()) {
+        SEL sel = NSSelectorFromString(selName);
+        BOOL hasMethod = NO;
+        @try { hasMethod = (class_getInstanceMethod(cls, sel) != NULL); }
+        @catch (...) { continue; }
+        if (hasMethod) {
+            if (trySwizzle(cls, sel, @selector(wxi_onRevokeMsg:))) {
+                WXILog(@"Hooked revoke-msg: [%@ %@]", NSStringFromClass(cls), selName);
+                break;
+            }
+        }
+    }
+}
+
+static void hookObjCClasses(void) {
+    BOOL hooked = NO;
+    
+    // Try well-known class names first
+    for (NSString *className in kCandidateClasses()) {
+        Class cls = NSClassFromString(className);
+        if (cls) {
+            WXILog(@"Installing hooks on known class: %@", className);
+            hookClass(cls);
+            hooked = YES;
+        }
+    }
+    
+    if (!hooked) {
+        WXILog(@"Known ObjC class names not found — scanning runtime...");
+        
+        unsigned int classCount = 0;
+        Class *classes = objc_copyClassList(&classCount);
+        if (!classes) return;
+        
+        unsigned int checked = 0;
+        NSMutableArray *allSels = [NSMutableArray array];
+        [allSels addObjectsFromArray:kAddMsgSelectors()];
+        [allSels addObjectsFromArray:kRevokeMsgSelectors()];
+        
+        for (unsigned int i = 0; i < classCount; i++) {
+            Class cls = classes[i];
+            const char *name = class_getName(cls);
+            if (!name || !isWeChatRelatedClass(name)) continue;
+            checked++;
+            
+            for (NSString *selName in allSels) {
+                SEL sel = NSSelectorFromString(selName);
+                @try {
+                    if (class_getInstanceMethod(cls, sel)) {
+                        WXILog(@"Discovered class with [%s %@]", name, selName);
+                        hookClass(cls);
+                        hooked = YES;
+                        break;
+                    }
+                } @catch (...) { continue; }
+            }
+        }
+        
+        free(classes);
+        WXILog(@"Scanned %u WeChat-related classes out of %u total. Hooked=%d",
+               checked, classCount, hooked);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 5. Runtime class enumeration diagnostic — log EVERY class that contains
+//    message-related strings for debugging purposes
+// ---------------------------------------------------------------------------
+
+static void dumpWeChatClasses(void) {
+    unsigned int classCount = 0;
+    Class *classes = objc_copyClassList(&classCount);
+    if (!classes) return;
+    
+    WXILog(@"=== Runtime class dump (total: %u) ===", classCount);
+    
+    NSMutableArray *interestingClasses = [NSMutableArray array];
+    
+    for (unsigned int i = 0; i < classCount; i++) {
+        const char *name = class_getName(classes[i]);
+        if (!name) continue;
+        
+        // Look for ANY class containing interesting substrings
+        if (strcasestr(name, "msg") || strcasestr(name, "message") ||
+            strcasestr(name, "revoke") || strcasestr(name, "recall") ||
+            strcasestr(name, "chat") || strcasestr(name, "sync") ||
+            strcasestr(name, "session") || strcasestr(name, "wcdb") ||
+            strcasestr(name, "WCT") || strcasestr(name, "sqlite") ||
+            strcasestr(name, "DB") || strcasestr(name, "database")) {
+            
+            // Skip known system classes
+            if (strncmp(name, "NS", 2) == 0 || strncmp(name, "_NS", 3) == 0 ||
+                strncmp(name, "OS_", 3) == 0) continue;
+            
+            [interestingClasses addObject:[NSString stringWithUTF8String:name]];
+        }
+    }
+    
+    free(classes);
+    
+    // Sort and write to file (NSLog redacts strings on macOS)
+    [interestingClasses sortUsingSelector:@selector(compare:)];
+    WXILog(@"Found %lu interesting classes, writing to file...",
+           (unsigned long)interestingClasses.count);
+    
+    NSMutableString *dump = [NSMutableString stringWithFormat:
+        @"=== WxIntercept Runtime Class Dump ===\n"
+        @"Total classes: %u | Interesting: %lu\n\n",
+        classCount, (unsigned long)interestingClasses.count];
+    
+    for (NSString *cls in interestingClasses) {
+        Class c = NSClassFromString(cls);
+        if (!c) continue;
+        
+        unsigned int methodCount = 0;
+        Method *methods = NULL;
+        @try { methods = class_copyMethodList(c, &methodCount); }
+        @catch (...) { continue; }
+        
+        NSMutableArray *methodNames = [NSMutableArray array];
+        if (methods) {
+            for (unsigned int j = 0; j < methodCount; j++) {
+                SEL sel = method_getName(methods[j]);
+                [methodNames addObject:NSStringFromSelector(sel)];
+            }
+            free(methods);
+        }
+        
+        [dump appendFormat:@"--- %@ (%u methods) ---\n", cls, methodCount];
+        for (NSString *m in methodNames) {
+            [dump appendFormat:@"  %@\n", m];
+        }
+        [dump appendString:@"\n"];
+    }
+    
+    NSString *path = [NSTemporaryDirectory()
+                      stringByAppendingPathComponent:@"wxintercept_class_dump.txt"];
+    [dump writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    WXILog(@"Class dump written to: %@", path);
+}
+
+// ---------------------------------------------------------------------------
+// Notification display
+// ---------------------------------------------------------------------------
+static void showNotification(NSString *sender, NSString *content) {
+    NSString *title = sender.length
+        ? [NSString stringWithFormat:@"撤回消息 — %@", sender]
+        : @"撤回消息";
+    NSString *body = content.length ? content : @"[消息已被撤回]";
+
+    Class UNCenter = NSClassFromString(@"UNUserNotificationCenter");
+    if (UNCenter) {
+        id center = [UNCenter performSelector:@selector(currentNotificationCenter)];
+        if (!center) {
+            center = ((id (*)(id, SEL))objc_msgSend)((id)UNCenter,
+                                  NSSelectorFromString(@"currentNotificationCenter"));
+        }
+
+        SEL reqAuth = NSSelectorFromString(@"requestAuthorizationWithOptions:completionHandler:");
+        if ([center respondsToSelector:reqAuth]) {
+            NSMethodSignature *sig = [center methodSignatureForSelector:reqAuth];
+            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+            inv.target   = center;
+            inv.selector = reqAuth;
+            NSUInteger opts = (1 << 2) | (1 << 3);
+            [inv setArgument:&opts atIndex:2];
+            void (^dummy)(BOOL, NSError *) = ^(BOOL g, NSError *e){};
+            [inv setArgument:&dummy atIndex:3];
+            [inv invoke];
+        }
+
+        Class contentClass = NSClassFromString(@"UNMutableNotificationContent");
+        id notifContent = [contentClass new];
+        [notifContent setValue:title forKey:@"title"];
+        [notifContent setValue:body  forKey:@"body"];
+
+        Class reqClass = NSClassFromString(@"UNNotificationRequest");
+        NSString *identifier =
+            [NSString stringWithFormat:@"wxintercept.%f",
+             [NSDate date].timeIntervalSince1970];
+        SEL reqWith = NSSelectorFromString(@"requestWithIdentifier:content:trigger:");
+        NSMethodSignature *rSig = [reqClass methodSignatureForSelector:reqWith];
+        if (rSig) {
+            NSInvocation *rInv = [NSInvocation invocationWithMethodSignature:rSig];
+            rInv.target   = (id)reqClass;
+            rInv.selector = reqWith;
+            [rInv setArgument:&identifier   atIndex:2];
+            [rInv setArgument:&notifContent atIndex:3];
+            id trigger = nil;
+            [rInv setArgument:&trigger      atIndex:4];
+            [rInv invoke];
+            __unsafe_unretained id request;
+            [rInv getReturnValue:&request];
+
+            if (request) {
+                SEL addReq = NSSelectorFromString(@"addNotificationRequest:withCompletionHandler:");
+                NSMethodSignature *aSig = [center methodSignatureForSelector:addReq];
+                if (aSig) {
+                    NSInvocation *aInv = [NSInvocation invocationWithMethodSignature:aSig];
+                    aInv.target   = center;
+                    aInv.selector = addReq;
+                    [aInv setArgument:&request atIndex:2];
+                    id nilBlock = nil;
+                    [aInv setArgument:&nilBlock atIndex:3];
+                    [aInv invoke];
+                    WXILog(@"Notification sent: %@ — %@", title, body);
+                    return;
+                }
+            }
+        }
+    }
+
+    // Legacy fallback
+    Class NSUNClass = NSClassFromString(@"NSUserNotification");
+    Class NSUNCenterClass = NSClassFromString(@"NSUserNotificationCenter");
+    if (NSUNClass && NSUNCenterClass) {
+        @try {
+            id notif = [NSUNClass new];
+            [notif setValue:title forKey:@"title"];
+            [notif setValue:body  forKey:@"informativeText"];
+            id center = [NSUNCenterClass
+                         performSelector:@selector(defaultUserNotificationCenter)];
+            [center performSelector:@selector(deliverNotification:) withObject:notif];
+        } @catch (NSException *e) {
+            WXILog(@"Legacy notification failed: %@", e);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NSNotificationCenter monitor — catch any WeChat revoke notifications
+// ---------------------------------------------------------------------------
+static void setupNotificationFallback(void) {
+    WXILog(@"Setting up NSNotificationCenter monitoring...");
+    
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:nil object:nil queue:nil
+                usingBlock:^(NSNotification *note) {
+        NSString *name = note.name;
+        if ([name containsString:@"revoke"] || [name containsString:@"Revoke"] ||
+            [name containsString:@"REVOKE"] || [name containsString:@"recall"] ||
+            [name containsString:@"Recall"]) {
+            WXILog(@"Caught notification: %@ userInfo=%@", name, note.userInfo);
+            showNotification(@"未知", @"检测到撤回通知");
+        }
+    }];
+}
+
+// ---------------------------------------------------------------------------
+// Constructor — entry point when dylib is loaded
+// ---------------------------------------------------------------------------
+__attribute__((constructor))
+static void WxInterceptInitialize(void) {
+    WXILog(@"=== WxIntercept loaded ===");
+    WXILog(@"Build: %s %s", __DATE__, __TIME__);
+    WXILog(@"WeChat 4.x dual-hook strategy: fishhook (SQLite + Mojo IPC) + ObjC fallback");
+    
+    // Initialize shared state
+    sSqliteQueue = dispatch_queue_create("com.wxintercept.sqlite", DISPATCH_QUEUE_SERIAL);
+    sRecentMessages = [NSMutableDictionary new];
+    
+    // Strategy 1: Hook SQLite — this is the most reliable approach for WeChat 4.x
+    // because ALL message operations go through WCDB/SQLite regardless of the
+    // C++/Rust/ObjC boundary.
+    hookSQLiteOperations();
+    
+    // Strategy 2: Hook Mojo IPC — DISABLED
+    // Mojo IPC hooks cause KERN_PROTECTION_FAILURE crashes in libmmmojo.dylib.
+    // The SetMMMojoEnvironmentCallbacks signature doesn't match our hook prototype
+    // (second arg is an integer index, not a pointer to callbacks), and rebinding
+    // these symbols corrupts libmmmojo's internal dispatch tables.
+    // hookMojoIPC();
+    WXILog(@"Mojo IPC hooks SKIPPED (known crash risk with WeChat 4.x).");
+    
+    // Strategy 3: Monitor message database directory for changes
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        monitorMessageDatabase();
+    });
+    
+    // Strategy 4: Try ObjC swizzling (works for WeChat < 4.x)
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        hookObjCClasses();
+    });
+    
+    // Strategy 5: NSNotificationCenter fallback
+    // NOTE: Observing *all* notifications (name:nil) is very heavy and can
+    // interfere with normal WeChat operation.  Disabled for stability.
+    // setupNotificationFallback();
+    WXILog(@"NSNotificationCenter blanket observer SKIPPED (stability).");
+    
+    // Diagnostic: dump runtime classes (temporarily always-on for analysis)
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        dumpWeChatClasses();
+    });
+    
+    WXILog(@"All hook strategies initialized. Waiting for WeChat messages...");
+}
